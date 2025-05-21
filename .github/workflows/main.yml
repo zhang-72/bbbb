@@ -1,0 +1,106 @@
+name: Auto Update Worker
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 1 * * *" # 每天凌晨1点运行
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置环境
+        run: |
+          # 建议使用 /latest 获取最新 release，如果源仓库只发布一个 release，也可以保留 /releases
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases/latest" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
+
+      - name: 检查并更新 Worker
+        id: check_update_step # 添加 ID 以便在其他步骤中引用其输出
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
+        run: |
+          set -x # 启用调试输出
+          # 日志函数
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
+
+          log "开始检查更新..."
+
+          # 获取本地版本
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "本地版本: ${LOCAL_VERSION:-无}"
+
+          # 获取最新 Release
+          log "获取最新 Release 信息..."
+          # 注意：如果 REPO_URL 是 /releases/latest，RESPONSE 就是一个 JSON 对象而不是数组
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "ERROR: 无法访问 GitHub API"
+            exit 1
+          fi
+
+          # 检查 RESPONSE 是否为空或无效 JSON
+          if [ -z "$RESPONSE" ] || ! echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+              log "ERROR: GitHub API 返回空或无效的 JSON 响应"
+              exit 1
+          fi
+
+          # 如果 REPO_URL 是 /releases/latest，则直接解析对象
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 未找到 $TARGET_FILE 或 DOWNLOAD_URL 为空/null。请检查源仓库 Release 是否包含 'worker.zip'。"
+            exit 1
+          fi
+          log "最新版本: $TAG_NAME"
+
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "已是最新版本，无需更新"
+            # 即使无需更新，也输出 TAG_NAME，以便后续提交消息使用
+            echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 下载并更新
+          log "下载 $TARGET_FILE..."
+          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+          if [ $? -ne 0 ]; then
+              log "ERROR: 下载 $TARGET_FILE 失败"
+              exit 1
+          fi
+          log "解压 $TARGET_FILE..."
+          unzip -o "$TARGET_FILE"
+          if [ $? -ne 0 ]; then
+              log "ERROR: 解压 $TARGET_FILE 失败"
+              exit 1
+          fi
+          rm "$TARGET_FILE"
+          echo "$TAG_NAME" > version.txt
+          log "更新完成，新版本: $TAG_NAME"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT" # 将 tag_name 作为输出
+          log "已设置输出 tag_name: $TAG_NAME"
+
+
+      - name: 提交更改
+        if: success() && steps.check_update_step.outputs.tag_name != '' # 仅在更新成功且有新版本时提交
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update_step.outputs.tag_name || '未知' }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
